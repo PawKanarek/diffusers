@@ -279,6 +279,55 @@ def get_params_to_save(params):
     return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
 
 
+# We need to tokenize input captions and transform the images.
+def encode_prompt(batch, text_encoders, tokenizers, caption_column, is_train=True):
+    prompt_embeds_list = []
+    prompt_batch = batch[caption_column]
+
+    captions = []
+    for caption in prompt_batch:
+        if isinstance(caption, str):
+            captions.append(caption)
+        elif isinstance(caption, (list, np.ndarray)):
+            # take a random caption if there are multiple
+            captions.append(random.choice(caption) if is_train else caption[0])
+        else:
+            raise ValueError(f"Caption column `{caption_column}` should contain either strings or lists of strings.")
+    # from pipeline_flax_stable_diffusuion_xl.py
+    for tokenizer, text_encoder in zip(tokenizers, text_encoders):
+        text_inputs = tokenizer(
+            captions, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="np"
+        )
+        text_input_ids = text_inputs.input_ids
+        # TODO: verify if below line is needed, because in pipeline there is also this jnp.stack, but probably because we do it in loop.
+        # inputs = jnp.stack(inputs, axis=1)
+
+        # in pipline text_encoder is called with params, why we dont do it here?
+        prompt_embeds = text_encoder(text_input_ids, output_hidden_states=True)
+        # We are only ALWAYS interested in the pooled output of the final text encoder
+        pooled_prompt_embeds = prompt_embeds[0]
+        prompt_embeds = prompt_embeds.hidden_states[-2]
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = jnp.reshape(prompt_embeds, (bs_embed, seq_len, -1))
+        prompt_embeds_list.append(prompt_embeds)
+
+    prompt_embeds = jnp.concatenate(prompt_embeds_list, axis=0)
+    pooled_prompt_embeds = jnp.reshape(pooled_prompt_embeds, (bs_embed, -1))
+    return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
+
+
+def compute_vae_encodings(batch, vae):
+    images = batch.pop("pixel_values")
+    pixel_values = torch.stack(list(images))
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
+
+    with torch.no_grad():
+        model_input = vae.encode(pixel_values).latent_dist.sample()
+    model_input = model_input * vae.config.scaling_factor
+    return {"model_input": model_input.cpu()}
+
+
 def main():
     args = parse_args()
 
@@ -308,6 +357,46 @@ def main():
                 exist_ok=True,
                 token=args.hub_token,
             ).repo_id
+
+    weight_dtype = jnp.float32
+    if args.mixed_precision == "fp16":
+        weight_dtype = jnp.float16
+    elif args.mixed_precision == "bf16":
+        weight_dtype = jnp.bfloat16
+
+    # Load models and create wrapper for stable diffusion
+    tokenizer_one = AutoTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False
+    )
+    tokenizer_two = AutoTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer_2", use_fast=False
+    )
+
+    text_encoder_one = FlaxCLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", dtype=weight_dtype
+    )
+    text_encoder_two = FlaxCLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", dtype=weight_dtype
+    )
+
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", dtype=weight_dtype
+    )
+    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", dtype=weight_dtype
+    )
+
+    constant_scheduler = optax.constant_schedule(args.learning_rate)
+
+    adamw = optax.adamw(
+        learning_rate=constant_scheduler,
+        b1=args.adam_beta1,
+        b2=args.adam_beta2,
+        eps=args.adam_epsilon,
+        weight_decay=args.adam_weight_decay,
+    )
+    optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adamw)
+    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -358,43 +447,39 @@ def main():
             )
 
     # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions,
-            max_length=tokenizer.model_max_length,
-            padding="do_not_pad",
-            truncation=True,
-        )
-        input_ids = inputs.input_ids
-        return input_ids
-
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+    train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
+    train_flip = transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x)
+    train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        # image aug
+        original_sizes = []
+        all_images = []
+        crop_top_lefts = []
+        for image in images:
+            original_sizes.append((image.height, image.width))
+            image = train_resize(image)
+            if args.center_crop:
+                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+                image = train_crop(image)
+            else:
+                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
+                image = crop(image, y1, x1, h, w)
+            if args.random_flip and random.random() < 0.5:
+                # flip
+                x1 = image.width - x1
+                image = train_flip(image)
+            crop_top_left = (y1, x1)
+            crop_top_lefts.append(crop_top_left)
+            image = train_transforms(image)
+            all_images.append(image)
 
+        examples["original_sizes"] = original_sizes
+        examples["crop_top_lefts"] = crop_top_lefts
+        examples["pixel_values"] = all_images
         return examples
 
     if args.max_train_samples is not None:
@@ -402,24 +487,49 @@ def main():
         # Set the training transforms
     train_dataset = dataset["train"].with_transform(preprocess_train)
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = [example["input_ids"] for example in examples]
+    # Let's first compute all the embeddings so that we can free up the text encoders
+    # from memory. We will pre-compute the VAE encodings too.
+    text_encoders = [text_encoder_one, text_encoder_two]
+    tokenizers = [tokenizer_one, tokenizer_two]
+    compute_embeddings_fn = functools.partial(
+        encode_prompt,
+        text_encoders=text_encoders,
+        tokenizers=tokenizers,
+        caption_column=caption_column,
+    )
+    compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
 
-        padded_tokens = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
+    if jax.process_index() == 0:
+        from datasets.fingerprint import Hasher
+
+        print("compute all embedings")
+
+        # fingerprint used by the cache for the other processes to load the result
+        # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
+        new_fingerprint = Hasher.hash(args)
+        new_fingerprint_for_vae = Hasher.hash("vae")
+        train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
+        train_dataset = train_dataset.map(
+            compute_vae_encodings_fn,
+            batched=True,
+            batch_size=args.train_batch_size * jax.local_device_count() * args.gradient_accumulation_steps,
+            new_fingerprint=new_fingerprint_for_vae,
         )
-        batch = {
-            "pixel_values": pixel_values,
-            "input_ids": padded_tokens.input_ids,
-        }
-        batch = {k: v.numpy() for k, v in batch.items()}
 
-        return batch
+    def collate_fn(examples):
+        model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
+        original_sizes = [example["original_sizes"] for example in examples]
+        crop_top_lefts = [example["crop_top_lefts"] for example in examples]
+        prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
+        pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+
+        return {
+            "model_input": model_input,
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "original_sizes": original_sizes,
+            "crop_top_lefts": crop_top_lefts,
+        }
 
     total_train_batch_size = args.train_batch_size * jax.local_device_count()
     train_dataloader = torch.utils.data.DataLoader(
@@ -428,41 +538,6 @@ def main():
         collate_fn=collate_fn,
         batch_size=total_train_batch_size,
         drop_last=True,
-    )
-
-    weight_dtype = jnp.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = jnp.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = jnp.bfloat16
-
-    # Load models and create wrapper for stable diffusion
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        from_pt=args.from_pt,
-        revision=args.revision,
-        subfolder="tokenizer",
-    )
-    text_encoder = FlaxCLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        from_pt=args.from_pt,
-        revision=args.revision,
-        subfolder="text_encoder",
-        dtype=weight_dtype,
-    )
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        from_pt=args.from_pt,
-        revision=args.revision,
-        subfolder="vae",
-        dtype=weight_dtype,
-    )
-    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        from_pt=args.from_pt,
-        revision=args.revision,
-        subfolder="unet",
-        dtype=weight_dtype,
     )
 
     # Optimization
@@ -498,51 +573,44 @@ def main():
     rng = jax.random.PRNGKey(args.seed)
     train_rngs = jax.random.split(rng, jax.local_device_count())
 
-    def train_step(state, text_encoder_params, vae_params, batch, train_rng):
+    def train_step(state, batch, train_rng):
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
         def compute_loss(params):
-            # Convert images to latent space
-            vae_outputs = vae.apply(
-                {"params": vae_params},
-                batch["pixel_values"],
-                deterministic=True,
-                method=vae.encode,
-            )
-            latents = vae_outputs.latent_dist.sample(sample_rng)
-            # (NHWC) -> (NCHW)
-            latents = jnp.transpose(latents, (0, 3, 1, 2))
-            latents = latents * vae.config.scaling_factor
-
             # Sample noise that we'll add to the latents
+            model_input = batch["model_input"]
             noise_rng, timestep_rng = jax.random.split(sample_rng)
-            noise = jax.random.normal(noise_rng, latents.shape)
-            # Sample a random timestep for each image
-            bsz = latents.shape[0]
-            timesteps = jax.random.randint(
-                timestep_rng,
-                (bsz,),
-                0,
-                noise_scheduler.config.num_train_timesteps,
+            noise = jax.random.normal(noise_rng, model_input.shape)
+            bsz = model_input.shape[0]
+            timesteps = torch.randint(timestep_rng, (bsz,), 0, noise_scheduler.config.num_train_timesteps)
+
+            # Add noise to the model input according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
+
+            # time ids
+            def compute_time_ids(original_size, crops_coords_top_left):
+                # Adapted from pipeline.FlaxStableDiffusionXLPipeline._get_add_time_ids
+                target_size = (args.resolution, args.resolution)
+                add_time_ids = list(original_size + crops_coords_top_left + target_size)
+                add_time_ids = jnp.array([add_time_ids] * bsz, dtype=weight_dtype)
+                return add_time_ids
+
+            add_time_ids = jnp.concatenate(
+                [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])], axis=0
             )
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(noise_scheduler_state, latents, noise, timesteps)
-
-            # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(
-                batch["input_ids"],
-                params=text_encoder_params,
-                train=False,
-            )[0]
-
-            # Predict the noise residual and compute loss
+            # Predict the noise residual
+            unet_added_conditions = {"time_ids": add_time_ids}
+            prompt_embeds = batch["prompt_embeds"]
+            pooled_prompt_embeds = batch["pooled_prompt_embeds"]
+            unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
             model_pred = unet.apply(
                 {"params": params},
-                noisy_latents,
+                noisy_model_input,
                 timesteps,
-                encoder_hidden_states,
+                prompt_embeds,
+                added_cond_kwargs=unet_added_conditions,
                 train=True,
             ).sample
 
@@ -550,13 +618,12 @@ def main():
             if noise_scheduler.config.prediction_type == "epsilon":
                 target = noise
             elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(noise_scheduler_state, latents, noise, timesteps)
+                target = noise_scheduler.get_velocity(noise_scheduler_state, model_input, noise, timesteps)
             else:
                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
             loss = (target - model_pred) ** 2
             loss = loss.mean()
-
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)
@@ -575,7 +642,8 @@ def main():
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
-    text_encoder_params = jax_utils.replicate(text_encoder.params)
+    text_encoder_one_params = jax_utils.replicate(text_encoder_one.params)
+    text_encoder_two_params = jax_utils.replicate(text_encoder_two.params)
     vae_params = jax_utils.replicate(vae_params)
 
     # Train!
@@ -599,7 +667,6 @@ def main():
     epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
         # ======================== Training ================================
-
         train_metrics = []
 
         steps_per_epoch = len(train_dataset) // total_train_batch_size
@@ -607,7 +674,7 @@ def main():
         # train
         for batch in train_dataloader:
             batch = shard(batch)
-            state, train_metric, train_rngs = p_train_step(state, text_encoder_params, vae_params, batch, train_rngs)
+            state, train_metric, train_rngs = p_train_step(state, batch, train_rngs)
             train_metrics.append(train_metric)
 
             train_step_progress_bar.update(1)
@@ -629,26 +696,23 @@ def main():
             beta_schedule="scaled_linear",
             skip_prk_steps=True,
         )
-        safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
-            "CompVis/stable-diffusion-safety-checker", from_pt=True
-        )
-        pipeline = FlaxStableDiffusionPipeline(
-            text_encoder=text_encoder,
+        pipeline = FlaxStableDiffusionXLPipeline(
+            text_encoder=text_encoder_one,
+            text_encoder_2=text_encoder_two,
             vae=vae,
             unet=unet,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer_one,
+            tokenizer_2=tokenizer_two,
             scheduler=scheduler,
-            safety_checker=safety_checker,
-            feature_extractor=CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32"),
         )
 
         pipeline.save_pretrained(
             args.output_dir,
             params={
-                "text_encoder": get_params_to_save(text_encoder_params),
+                "text_encoder": get_params_to_save(text_encoder_one_params),
+                "text_encoder_2": get_params_to_save(text_encoder_two_params),
                 "vae": get_params_to_save(vae_params),
                 "unet": get_params_to_save(state.params),
-                "safety_checker": safety_checker.params,
             },
         )
 
@@ -662,5 +726,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
     main()
