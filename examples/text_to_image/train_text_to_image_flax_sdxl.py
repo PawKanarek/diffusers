@@ -1,4 +1,5 @@
 import argparse
+import functools
 import logging
 import math
 import os
@@ -18,14 +19,15 @@ from flax.training import train_state
 from flax.training.common_utils import shard
 from huggingface_hub import create_repo, upload_folder
 from torchvision import transforms
+from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import CLIPImageProcessor, CLIPTokenizer, FlaxCLIPTextModel, set_seed
+from transformers import AutoTokenizer, CLIPImageProcessor, FlaxCLIPTextModel, set_seed
 
 from diffusers import (
     FlaxAutoencoderKL,
     FlaxDDPMScheduler,
     FlaxPNDMScheduler,
-    FlaxStableDiffusionPipeline,
+    FlaxStableDiffusionXLPipeline,
     FlaxUNet2DConditionModel,
 )
 from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
@@ -87,7 +89,10 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+        "--image_column",
+        type=str,
+        default="image",
+        help="The column of the dataset containing an image.",
     )
     parser.add_argument(
         "--caption_column",
@@ -141,7 +146,10 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size",
+        type=int,
+        default=16,
+        help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -171,13 +179,37 @@ def parse_args():
             ' "constant", "constant_with_warmup"]'
         ),
     )
-    parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
+    parser.add_argument(
+        "--adam_beta1",
+        type=float,
+        default=0.9,
+        help="The beta1 parameter for the Adam optimizer.",
+    )
+    parser.add_argument(
+        "--adam_beta2",
+        type=float,
+        default=0.999,
+        help="The beta2 parameter for the Adam optimizer.",
+    )
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument(
+        "--adam_epsilon",
+        type=float,
+        default=1e-08,
+        help="Epsilon value for the Adam optimizer",
+    )
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        help="Whether or not to push the model to the Hub.",
+    )
+    parser.add_argument(
+        "--hub_token",
+        type=str,
+        default=None,
+        help="The token to use to push to the Model Hub.",
+    )
     parser.add_argument(
         "--hub_model_id",
         type=str,
@@ -213,7 +245,12 @@ def parse_args():
             "and an Nvidia Ampere GPU."
         ),
     )
-    parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="For distributed training: local_rank",
+    )
     parser.add_argument(
         "--from_pt",
         action="store_true",
@@ -267,7 +304,9 @@ def main():
 
         if args.push_to_hub:
             repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+                repo_id=args.hub_model_id or Path(args.output_dir).name,
+                exist_ok=True,
+                token=args.hub_token,
             ).repo_id
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
@@ -278,7 +317,10 @@ def main():
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
-            args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            data_dir=args.train_data_dir,
         )
     else:
         data_files = {}
@@ -329,7 +371,12 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)
+        inputs = tokenizer(
+            captions,
+            max_length=tokenizer.model_max_length,
+            padding="do_not_pad",
+            truncation=True,
+        )
         input_ids = inputs.input_ids
         return input_ids
 
@@ -361,7 +408,10 @@ def main():
         input_ids = [example["input_ids"] for example in examples]
 
         padded_tokens = tokenizer.pad(
-            {"input_ids": input_ids}, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
+            {"input_ids": input_ids},
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
         )
         batch = {
             "pixel_values": pixel_values,
@@ -373,7 +423,11 @@ def main():
 
     total_train_batch_size = args.train_batch_size * jax.local_device_count()
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=total_train_batch_size, drop_last=True
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=total_train_batch_size,
+        drop_last=True,
     )
 
     weight_dtype = jnp.float32
@@ -433,7 +487,10 @@ def main():
     state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
     noise_scheduler = FlaxDDPMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        num_train_timesteps=1000,
     )
     noise_scheduler_state = noise_scheduler.create_state()
 
@@ -447,7 +504,10 @@ def main():
         def compute_loss(params):
             # Convert images to latent space
             vae_outputs = vae.apply(
-                {"params": vae_params}, batch["pixel_values"], deterministic=True, method=vae.encode
+                {"params": vae_params},
+                batch["pixel_values"],
+                deterministic=True,
+                method=vae.encode,
             )
             latents = vae_outputs.latent_dist.sample(sample_rng)
             # (NHWC) -> (NCHW)
@@ -479,7 +539,11 @@ def main():
 
             # Predict the noise residual and compute loss
             model_pred = unet.apply(
-                {"params": params}, noisy_latents, timesteps, encoder_hidden_states, train=True
+                {"params": params},
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states,
+                train=True,
             ).sample
 
             # Get the target for loss depending on the prediction type
@@ -560,7 +624,10 @@ def main():
     # Create the pipeline using using the trained modules and save it.
     if jax.process_index() == 0:
         scheduler = FlaxPNDMScheduler(
-            beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            skip_prk_steps=True,
         )
         safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
             "CompVis/stable-diffusion-safety-checker", from_pt=True
@@ -595,4 +662,5 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
     main()
