@@ -430,8 +430,9 @@ def main():
         adamw,
     )
 
+    print("CREATE STATE")
     state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
-
+    print("AFTER CREATE STATE")
     noise_scheduler = FlaxDDPMScheduler(
         beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000
     )

@@ -5,6 +5,7 @@ import math
 import os
 import random
 from pathlib import Path
+from typing import List
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,14 @@ from huggingface_hub import create_repo, upload_folder
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, CLIPImageProcessor, FlaxCLIPTextModel, set_seed
+from transformers import (
+    AutoTokenizer,
+    CLIPImageProcessor,
+    CLIPTokenizer,
+    FlaxCLIPTextModel,
+    FlaxCLIPTextModelWithProjection,
+    set_seed,
+)
 
 from diffusers import (
     FlaxAutoencoderKL,
@@ -30,7 +38,6 @@ from diffusers import (
     FlaxStableDiffusionXLPipeline,
     FlaxUNet2DConditionModel,
 )
-from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
 from diffusers.utils import check_min_version
 
 
@@ -108,6 +115,12 @@ def parse_args():
             "For debugging purposes or quicker training, truncate the number of training examples to this "
             "value if set."
         ),
+    )
+    parser.add_argument(
+        "--proportion_empty_prompts",
+        type=float,
+        default=0,
+        help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
     )
     parser.add_argument(
         "--output_dir",
@@ -266,6 +279,8 @@ def parse_args():
     # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
+    if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
+        raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
     return args
 
@@ -280,43 +295,59 @@ def get_params_to_save(params):
 
 
 # We need to tokenize input captions and transform the images.
-def encode_prompt(batch, text_encoders, tokenizers, caption_column, is_train=True):
-    prompt_embeds_list = []
+def encode_prompt(
+    batch,
+    text_encoder_1: FlaxCLIPTextModel,
+    text_encoder_2: FlaxCLIPTextModelWithProjection,
+    tokenizer_1: CLIPTokenizer,
+    tokenizer_2: CLIPTokenizer,
+    proportion_empty_prompts,
+    caption_column,
+    dtype,
+    is_train=True,
+):
     prompt_batch = batch[caption_column]
-
     captions = []
     for caption in prompt_batch:
-        if isinstance(caption, str):
+        if random.random() < proportion_empty_prompts:
+            captions.append("")
+        elif isinstance(caption, str):
             captions.append(caption)
         elif isinstance(caption, (list, np.ndarray)):
             # take a random caption if there are multiple
             captions.append(random.choice(caption) if is_train else caption[0])
         else:
             raise ValueError(f"Caption column `{caption_column}` should contain either strings or lists of strings.")
-    # from pipeline_flax_stable_diffusuion_xl.py
-    for tokenizer, text_encoder in zip(tokenizers, text_encoders):
-        text_inputs = tokenizer(
-            captions, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="np"
-        )
-        text_input_ids = text_inputs.input_ids
-        # TODO: verify if below line is needed, because in pipeline there is also this jnp.stack, but probably because we do it in loop.
-        # inputs = jnp.stack(inputs, axis=1)
 
-        # in pipline text_encoder is called with params, why we dont do it here?
-        prompt_embeds = text_encoder(text_input_ids, output_hidden_states=True)
-        # We are only ALWAYS interested in the pooled output of the final text encoder
-        pooled_prompt_embeds = prompt_embeds[0]
-        prompt_embeds = prompt_embeds.hidden_states[-2]
-        bs_embed, seq_len, _ = prompt_embeds.shape
-        prompt_embeds = jnp.reshape(prompt_embeds, (bs_embed, seq_len, -1))
-        prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = jnp.concatenate(prompt_embeds_list, axis=0)
-    pooled_prompt_embeds = jnp.reshape(pooled_prompt_embeds, (bs_embed, -1))
+    # from pipeline_flax_stable_diffusion_xl.py
+    print("compute text imputs from tokenizer 1")
+    text_inputs_1 = tokenizer_1(
+        captions, padding="max_length", max_length=tokenizer_1.model_max_length, truncation=True, return_tensors="np"
+    )
+    prompt_embeds_1_out = text_encoder_1(
+        text_inputs_1.input_ids, params=text_encoder_1.params, output_hidden_states=True
+    )
+    prompt_embeds_1 = prompt_embeds_1_out["hidden_states"][-2].astype(dtype)
+    print(f"{prompt_embeds_1.shape=}, {prompt_embeds_1.dtype=}")
+    text_inputs_2 = tokenizer_2(
+        captions, padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="np"
+    )
+    print(f"ids from tokenizer2  {text_inputs_2.input_ids.shape=}, {text_inputs_2.input_ids.dtype=}")
+    prompt_embeds_2_out = text_encoder_2(
+        text_inputs_2.input_ids, params=text_encoder_2.params, output_hidden_states=True
+    )
+    # We are only ALWAYS interested in the pooled output of the final text encoder
+    prompt_embeds_2 = prompt_embeds_2_out["hidden_states"][-2].astype(dtype)
+    pooled_prompt_embeds = prompt_embeds_2_out["text_embeds"].astype(dtype)
+    prompt_embeds = jnp.concatenate([prompt_embeds_1, prompt_embeds_2], axis=-1)
+    print(
+        f"{prompt_embeds.shape=}, {prompt_embeds.dtype=} {pooled_prompt_embeds.shape=}, {pooled_prompt_embeds.dtype=}"
+    )
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
 
 def compute_vae_encodings(batch, vae):
+    print("encode vae encodings")
     images = batch.pop("pixel_values")
     pixel_values = torch.stack(list(images))
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -357,46 +388,6 @@ def main():
                 exist_ok=True,
                 token=args.hub_token,
             ).repo_id
-
-    weight_dtype = jnp.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = jnp.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = jnp.bfloat16
-
-    # Load models and create wrapper for stable diffusion
-    tokenizer_one = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False
-    )
-    tokenizer_two = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer_2", use_fast=False
-    )
-
-    text_encoder_one = FlaxCLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", dtype=weight_dtype
-    )
-    text_encoder_two = FlaxCLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", dtype=weight_dtype
-    )
-
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", dtype=weight_dtype
-    )
-    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", dtype=weight_dtype
-    )
-
-    constant_scheduler = optax.constant_schedule(args.learning_rate)
-
-    adamw = optax.adamw(
-        learning_rate=constant_scheduler,
-        b1=args.adam_beta1,
-        b2=args.adam_beta2,
-        eps=args.adam_epsilon,
-        weight_decay=args.adam_weight_decay,
-    )
-    optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adamw)
-    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
@@ -446,6 +437,58 @@ def main():
                 f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
 
+    total_train_batch_size = args.train_batch_size * jax.local_device_count()
+    weight_dtype = jnp.float32
+    if args.mixed_precision == "fp16":
+        weight_dtype = jnp.float16
+    elif args.mixed_precision == "bf16":
+        weight_dtype = jnp.bfloat16
+
+    # Load models and create wrapper for stable diffusion
+    tokenizer_1 = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="tokenizer",
+        use_fast=False,
+    )
+    tokenizer_2 = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="tokenizer_2",
+        use_fast=False,
+    )
+    text_encoder_1 = FlaxCLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="text_encoder",
+        dtype=weight_dtype,
+    )
+    text_encoder_2 = FlaxCLIPTextModelWithProjection.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="text_encoder_2",
+        dtype=weight_dtype,
+    )
+
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="vae",
+        dtype=weight_dtype,
+    )
+    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="unet",
+        dtype=weight_dtype,
+    )
+
     # Preprocessing the datasets.
     train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
     train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
@@ -480,6 +523,7 @@ def main():
         examples["original_sizes"] = original_sizes
         examples["crop_top_lefts"] = crop_top_lefts
         examples["pixel_values"] = all_images
+        print("finish preproces")
         return examples
 
     if args.max_train_samples is not None:
@@ -489,13 +533,15 @@ def main():
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory. We will pre-compute the VAE encodings too.
-    text_encoders = [text_encoder_one, text_encoder_two]
-    tokenizers = [tokenizer_one, tokenizer_two]
     compute_embeddings_fn = functools.partial(
         encode_prompt,
-        text_encoders=text_encoders,
-        tokenizers=tokenizers,
-        caption_column=caption_column,
+        text_encoder_1=text_encoder_1,
+        text_encoder_2=text_encoder_2,
+        tokenizer_1=tokenizer_1,
+        tokenizer_2=tokenizer_2,
+        proportion_empty_prompts=args.proportion_empty_prompts,
+        caption_column=args.caption_column,
+        dtype=weight_dtype,
     )
     compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
 
@@ -508,7 +554,10 @@ def main():
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
         new_fingerprint = Hasher.hash(args)
         new_fingerprint_for_vae = Hasher.hash("vae")
+        print("compute all embedings 1")
+
         train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
+        print("compute all embedings 2")
         train_dataset = train_dataset.map(
             compute_vae_encodings_fn,
             batched=True,
@@ -531,7 +580,6 @@ def main():
             "crop_top_lefts": crop_top_lefts,
         }
 
-    total_train_batch_size = args.train_batch_size * jax.local_device_count()
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -642,8 +690,8 @@ def main():
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
-    text_encoder_one_params = jax_utils.replicate(text_encoder_one.params)
-    text_encoder_two_params = jax_utils.replicate(text_encoder_two.params)
+    text_encoder_one_params = jax_utils.replicate(text_encoder_1.params)
+    text_encoder_two_params = jax_utils.replicate(text_encoder_2.params)
     vae_params = jax_utils.replicate(vae_params)
 
     # Train!
@@ -697,12 +745,12 @@ def main():
             skip_prk_steps=True,
         )
         pipeline = FlaxStableDiffusionXLPipeline(
-            text_encoder=text_encoder_one,
-            text_encoder_2=text_encoder_two,
+            text_encoder=text_encoder_1,
+            text_encoder_2=text_encoder_2,
             vae=vae,
             unet=unet,
-            tokenizer=tokenizer_one,
-            tokenizer_2=tokenizer_two,
+            tokenizer=tokenizer_1,
+            tokenizer_2=tokenizer_2,
             scheduler=scheduler,
         )
 
