@@ -150,8 +150,11 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         # bs, encoder_input, seq_length
         te_1_inputs = prompt_ids[:, 0, :]
         te_2_inputs = prompt_ids[:, 1, :]
+        text_encoder_params = params["text_encoder"]
 
-        prompt_embeds = self.text_encoder(te_1_inputs, params=params["text_encoder"], output_hidden_states=True)
+        print(f"{te_1_inputs.shape=}, {te_2_inputs.shape=}, {text_encoder_params=}")
+
+        prompt_embeds = self.text_encoder(te_1_inputs, params=text_encoder_params, output_hidden_states=True)
         prompt_embeds = prompt_embeds["hidden_states"][-2]
         prompt_embeds_2_out = self.text_encoder_2(
             te_2_inputs, params=params["text_encoder_2"], output_hidden_states=True

@@ -5,7 +5,6 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import List
 
 import jax
 import jax.numpy as jnp
@@ -448,6 +447,35 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = jnp.bfloat16
 
+    print("Fighting with RESOURCE_EXAUSTED BUG")
+    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        from_pt=args.from_pt,
+        revision=args.revision,
+        subfolder="unet",
+        dtype=weight_dtype,
+    )
+    # Optimization
+    if args.scale_lr:
+        args.learning_rate = args.learning_rate * total_train_batch_size
+
+    constant_scheduler = optax.constant_schedule(args.learning_rate)
+
+    adamw = optax.adamw(
+        learning_rate=constant_scheduler,
+        b1=args.adam_beta1,
+        b2=args.adam_beta2,
+        eps=args.adam_epsilon,
+        weight_decay=args.adam_weight_decay,
+    )
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm),
+        adamw,
+    )
+    print("Resource RESOURCE_EXAUSTED will be thrown")
+    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
+    print("created train state")
     # Load models and create wrapper for stable diffusion
     tokenizer_1 = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -483,13 +511,6 @@ def main():
         from_pt=args.from_pt,
         revision=args.revision,
         subfolder="vae",
-        dtype=weight_dtype,
-    )
-    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        from_pt=args.from_pt,
-        revision=args.revision,
-        subfolder="unet",
         dtype=weight_dtype,
     )
 
@@ -593,27 +614,6 @@ def main():
         batch_size=total_train_batch_size,
         drop_last=True,
     )
-
-    # Optimization
-    if args.scale_lr:
-        args.learning_rate = args.learning_rate * total_train_batch_size
-
-    constant_scheduler = optax.constant_schedule(args.learning_rate)
-
-    adamw = optax.adamw(
-        learning_rate=constant_scheduler,
-        b1=args.adam_beta1,
-        b2=args.adam_beta2,
-        eps=args.adam_epsilon,
-        weight_decay=args.adam_weight_decay,
-    )
-
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(args.max_grad_norm),
-        adamw,
-    )
-
-    state = train_state.TrainState.create(apply_fn=unet.__call__, params=unet_params, tx=optimizer)
 
     noise_scheduler = FlaxDDPMScheduler(
         beta_start=0.00085,
