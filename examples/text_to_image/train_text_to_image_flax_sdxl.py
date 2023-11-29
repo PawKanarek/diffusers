@@ -346,17 +346,21 @@ def encode_prompt(
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
 
-def compute_vae_encodings(batch, vae):
+def compute_vae_encodings(batch, vae: FlaxAutoencoderKL, vae_params, dtype, seed):
     print("encode vae encodings")
     images = batch.pop("pixel_values")
-    pixel_values = torch.stack(list(images))
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
+    pixel_values = jnp.stack([jnp.array(image) for image in images])
+    pixel_values = pixel_values.astype(dtype)
 
-    with torch.no_grad():
-        model_input = vae.encode(pixel_values).latent_dist.sample()
-    model_input = model_input * vae.config.scaling_factor
-    return {"model_input": model_input.cpu()}
+    # model_input = vae.encode(pixel_values)["latent_dist"].sample(seed=jax.random.PRNGKey(seed))
+
+    vae_out = vae.apply({"params": vae_params}, pixel_values, deterministic=True, method=vae.encode)
+    latents = vae_out.latent_dist.sample(jax.random.PRNGKey(seed))
+    # They do dis in train_controlnet_flax (NHWC) -> (NCHW)
+    # latents = jnp.transpose(latents, (0, 3, 1, 2))
+    model_input = latents * vae.config.scaling_factor
+
+    return {"model_input": model_input}
 
 
 def main():
@@ -543,7 +547,9 @@ def main():
         caption_column=args.caption_column,
         dtype=weight_dtype,
     )
-    compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
+    compute_vae_encodings_fn = functools.partial(
+        compute_vae_encodings, vae=vae, vae_params=vae_params, dtype=weight_dtype, seed=args.seed
+    )
 
     if jax.process_index() == 0:
         from datasets.fingerprint import Hasher
@@ -561,7 +567,7 @@ def main():
         train_dataset = train_dataset.map(
             compute_vae_encodings_fn,
             batched=True,
-            batch_size=args.train_batch_size * jax.local_device_count() * args.gradient_accumulation_steps,
+            batch_size=args.train_batch_size * jax.local_device_count(),
             new_fingerprint=new_fingerprint_for_vae,
         )
 
@@ -630,7 +636,12 @@ def main():
             noise_rng, timestep_rng = jax.random.split(sample_rng)
             noise = jax.random.normal(noise_rng, model_input.shape)
             bsz = model_input.shape[0]
-            timesteps = torch.randint(timestep_rng, (bsz,), 0, noise_scheduler.config.num_train_timesteps)
+            timesteps = torch.randint(
+                timestep_rng,
+                (bsz,),
+                0,
+                noise_scheduler.config.num_train_timesteps,
+            )
 
             # Add noise to the model input according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
