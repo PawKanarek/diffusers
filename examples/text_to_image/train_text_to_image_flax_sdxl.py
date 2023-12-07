@@ -493,6 +493,15 @@ def main():
         dtype=weight_dtype,
     )
 
+    if weight_dtype == jnp.float16:
+        print("converting weights to fp16")
+        unet_params = unet.to_fp16(unet_params)
+        vae_params = vae.to_fp16(vae_params)
+    elif weight_dtype == jnp.bfloat16:
+        print("converting weights to bf16")
+        unet_params = unet.bf_16(unet_params)
+        vae_params = vae.bf_16(vae_params)
+
     # Preprocessing the datasets.
     train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
     train_crop = transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution)
