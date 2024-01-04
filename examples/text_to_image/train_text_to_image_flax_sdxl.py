@@ -19,6 +19,8 @@ from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
 from huggingface_hub import create_repo, upload_folder
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
@@ -45,6 +47,25 @@ from diffusers.utils import check_min_version
 check_min_version("0.24.0.dev0")
 
 logger = logging.getLogger(__name__)
+
+# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+# os.environ["XLA_FLAGS"] = (
+#     "--xla_gpu_enable_triton_softmax_fusion=true "
+#     "--xla_gpu_triton_gemm_any=True "
+#     "--xla_gpu_enable_async_collectives=true "
+#     "--xla_gpu_enable_latency_hiding_scheduler=true "
+#     "--xla_gpu_enable_highest_priority_async_stream=true "
+# )
+
+
+device_mesh = mesh_utils.create_device_mesh((1, 2, 4))
+print(device_mesh)
+mesh = Mesh(devices=device_mesh, axis_names=("all", "split1", "split2"))
+print(mesh)
+
+
+def mesh_sharding(pspec: PartitionSpec) -> NamedSharding:
+    return NamedSharding(mesh, pspec)
 
 
 def parse_args():
@@ -291,7 +312,7 @@ dataset_name_mapping = {
 
 
 def get_params_to_save(params):
-    return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
+    return jax.device_get(jax.tree_util.tree_map(lambda x: x, params))
 
 
 # We need to tokenize input captions and transform the images.
@@ -306,6 +327,7 @@ def encode_prompt(
     dtype,
     is_train=True,
 ):
+    print("encode prompt")
     prompt_batch = batch[caption_column]
     captions = []
     for caption in prompt_batch:
@@ -357,7 +379,7 @@ def compute_vae_encodings(batch, vae: FlaxAutoencoderKL, vae_params, dtype, seed
     vae_out = vae.apply({"params": vae_params}, pixel_values, deterministic=True, method=vae.encode)
     latents = vae_out.latent_dist.sample(jax.random.PRNGKey(seed))
     # They do dis in train_controlnet_flax (NHWC) -> (NCHW)
-    # latents = jnp.transpose(latents, (0, 3, 1, 2))
+    latents = jnp.transpose(latents, (0, 3, 1, 2))
     model_input = latents * vae.config.scaling_factor
 
     return {"model_input": model_input}
@@ -440,8 +462,12 @@ def main():
             raise ValueError(
                 f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
-
-    total_train_batch_size = args.train_batch_size * jax.local_device_count()
+    # jax_devices = jax.local_devices()
+    # jax_devices = jax_devices[1:]
+    # n_devices = len(jax_devices)
+    # n_devices = 1
+    # I commented out n_devices to fix parallelis problems (but i dont know if this is good idea)
+    total_train_batch_size = args.train_batch_size  # * n_devices
     weight_dtype = jnp.float32
     if args.mixed_precision == "fp16":
         weight_dtype = jnp.float16
@@ -484,13 +510,16 @@ def main():
         revision=args.revision,
         subfolder="vae",
         dtype=weight_dtype,
+        # sharding=mesh_sharding(PartitionSpec("all")),
     )
+
     unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path,
         from_pt=args.from_pt,
         revision=args.revision,
         subfolder="unet",
         dtype=weight_dtype,
+        # sharding=mesh_sharding(PartitionSpec("all")),
     )
 
     if weight_dtype == jnp.float16:
@@ -576,16 +605,16 @@ def main():
         train_dataset = train_dataset.map(
             compute_vae_encodings_fn,
             batched=True,
-            batch_size=args.train_batch_size * jax.local_device_count(),
+            batch_size=args.train_batch_size,  # * n_devices,  dont use parallelism for now
             new_fingerprint=new_fingerprint_for_vae,
         )
 
     def collate_fn(examples):
-        model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
-        original_sizes = [example["original_sizes"] for example in examples]
-        crop_top_lefts = [example["crop_top_lefts"] for example in examples]
-        prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-        pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+        model_input = jnp.stack([jnp.asarray(example["model_input"]) for example in examples])
+        original_sizes = jnp.asarray([example["original_sizes"] for example in examples])
+        crop_top_lefts = jnp.asarray([example["crop_top_lefts"] for example in examples])
+        prompt_embeds = jnp.stack([jnp.asarray(example["prompt_embeds"]) for example in examples])
+        pooled_prompt_embeds = jnp.stack([jnp.asarray(example["pooled_prompt_embeds"]) for example in examples])
 
         return {
             "model_input": model_input,
@@ -634,7 +663,8 @@ def main():
 
     # Initialize our training
     rng = jax.random.PRNGKey(args.seed)
-    train_rngs = jax.random.split(rng, jax.local_device_count())
+    # train_rngs = jax.random.split(rng, n_devices)
+    train_rngs = rng
 
     def train_step(state, batch, train_rng):
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
@@ -645,29 +675,35 @@ def main():
             noise_rng, timestep_rng = jax.random.split(sample_rng)
             noise = jax.random.normal(noise_rng, model_input.shape)
             bsz = model_input.shape[0]
-            timesteps = torch.randint(
+            timesteps = jax.random.randint(
                 timestep_rng,
                 (bsz,),
                 0,
                 noise_scheduler.config.num_train_timesteps,
             )
+            timesteps = timesteps
 
             # Add noise to the model input according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
+            noisy_model_input = noise_scheduler.add_noise(noise_scheduler_state, model_input, noise, timesteps)
 
             # time ids
             def compute_time_ids(original_size, crops_coords_top_left):
-                # Adapted from pipeline.FlaxStableDiffusionXLPipeline._get_add_time_ids
-                target_size = (args.resolution, args.resolution)
-                add_time_ids = list(original_size + crops_coords_top_left + target_size)
-                add_time_ids = jnp.array([add_time_ids] * bsz, dtype=weight_dtype)
+                # original_size = jnp.squeeze(original_size)
+                # crops_coords_top_left = jnp.squeeze(crops_coords_top_left)
+                target_size = jnp.asarray((args.resolution, args.resolution))
+                add_time_ids = jnp.concatenate([original_size, crops_coords_top_left, target_size])
+                print(
+                    f"{add_time_ids.shape=}=cat({original_size.shape=},{crops_coords_top_left.shape=},{target_size.shape=})"
+                )
+                add_time_ids = jnp.array([add_time_ids], dtype=weight_dtype)
+                print(f"this should be 1,6 {add_time_ids.shape=}")
                 return add_time_ids
 
             add_time_ids = jnp.concatenate(
-                [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])], axis=0
+                [compute_time_ids(s, c) for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])]
             )
-
+            print(f"my: {add_time_ids.shape=}")
             # Predict the noise residual
             unet_added_conditions = {"time_ids": add_time_ids}
             prompt_embeds = batch["prompt_embeds"]
@@ -696,23 +732,28 @@ def main():
 
         grad_fn = jax.value_and_grad(compute_loss)
         loss, grad = grad_fn(state.params)
-        grad = jax.lax.pmean(grad, "batch")
+        # grad = jax.lax.pmean(grad, "batch")
 
         new_state = state.apply_gradients(grads=grad)
 
         metrics = {"loss": loss}
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
+        # metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return new_state, metrics, new_train_rng
 
     # Create parallel version of the train step
-    p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,))
+    print("replicating trainstep ...")
+    # p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,), devices=jax_devices[1:2])
 
     # Replicate the train state on each device
-    state = jax_utils.replicate(state)
-    text_encoder_one_params = jax_utils.replicate(text_encoder_1.params)
-    text_encoder_two_params = jax_utils.replicate(text_encoder_2.params)
-    vae_params = jax_utils.replicate(vae_params)
+    # print("replicating state ...")
+    # state = jax_utils.replicate(state, devices=jax_devices[2:3])
+    # print("replicating text_encoder_1_params ...")
+    # text_encoder_1_params = jax_utils.replicate(text_encoder_1.params, devices=jax_devices[3:4])
+    # print("replicating text_encoder_2_params ...")
+    # text_encoder_2_params = jax_utils.replicate(text_encoder_2.params, devices=jax_devices[4:5])
+    # print("replicating vae_params ...")
+    # vae_params = jax_utils.replicate(vae_params, devices=jax_devices[5:6])
 
     # Train!
     num_update_steps_per_epoch = math.ceil(len(train_dataloader))
@@ -741,8 +782,11 @@ def main():
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for batch in train_dataloader:
-            batch = shard(batch)
-            state, train_metric, train_rngs = p_train_step(state, batch, train_rngs)
+            # batch = shard(batch)
+            # batch = jax.tree_util.tree_map(lambda x: x.reshape((total_train_batch_size, -1) + x.shape[1:]), batch)
+
+            # state, train_metric, train_rngs = p_train_step(state, batch, train_rngs)
+            state, train_metric, train_rngs = train_step(state, batch, train_rngs)
             train_metrics.append(train_metric)
 
             train_step_progress_bar.update(1)
@@ -751,7 +795,7 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-        train_metric = jax_utils.unreplicate(train_metric)
+        # train_metric = jax_utils.unreplicate(train_metric)
 
         train_step_progress_bar.close()
         epochs.write(f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})")
@@ -777,8 +821,8 @@ def main():
         pipeline.save_pretrained(
             args.output_dir,
             params={
-                "text_encoder": get_params_to_save(text_encoder_one_params),
-                "text_encoder_2": get_params_to_save(text_encoder_two_params),
+                "text_encoder": get_params_to_save(text_encoder_1.params),
+                "text_encoder_2": get_params_to_save(text_encoder_2.params),
                 "vae": get_params_to_save(vae_params),
                 "unet": get_params_to_save(state.params),
             },
@@ -795,3 +839,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # exc = None
+    # with jax.profiler.trace("/mnt/disks/persist/repos/tensor_prf"):
+    #     try:
+    #         main()
+    #     except Exception as e:
+    #         exc = e
+    #         print(e)
+
+    # if exc is not None:
+    #     raise exc
